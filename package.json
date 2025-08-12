@@ -4,7 +4,12 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@vercel/blob": "0.24.0",
-    "adm-zip": "0.5.10"
+    "@vercel/blob": "^0.25.0",
+    "adm-zip": "^0.5.12",
+    "fs-extra": "^11.2.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
   }
 }
