@@ -1,14 +1,156 @@
-module.exports = (req, res) => {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-  const { original_file_id, figma_file_id } = req.body || {};
-  if (!original_file_id || !figma_file_id) return res.status(400).json({ error: 'original_file_id and figma_file_id are required' });
-  res.status(200).json({
-    avg_parity: 96.4,
-    frames_total: 12,
-    frames_passed: 11,
-    issues: [
-      { frame: "Home/Hero", type: "font", note: "Fallback changed line height slightly" }
-    ],
-    diff_bundle_url: "https://example.com/qc/diff.zip"
+// api/qc_check_figma.js
+import { put } from "@vercel/blob";
+
+export const config = { api: { bodyParser: { sizeLimit: "2mb" } } };
+
+/**
+ * Inputs (POST JSON):
+ * - file_id: string (e.g., "file_1")
+ * - sketch_audit: object from uploadAndAuditSketch for this file. Example:
+ *     {
+ *       pages: 2, symbols: 4, text_layers: 20,
+ *       hidden_layers: 3, empty_groups: 0,
+ *       shared_text_styles: 5, shared_color_styles: 7
+ *     }
+ * - figma_meta: optional object with the same shape (if you later collect it)
+ * - notes: optional string to include in the report
+ *
+ * Output:
+ * - qc_score (0..100)
+ * - deltas per field
+ * - report_url (Markdown written to Blob)
+ */
+export default async function handler(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+
+  const { file_id, sketch_audit, figma_meta, notes } = req.body || {};
+  if (!file_id || !sketch_audit) {
+    return res.status(400).json({ error: "file_id and sketch_audit are required" });
+  }
+
+  // Fields we compare for quick parity
+  const fields = [
+    "pages",
+    "symbols",
+    "text_layers",
+    "hidden_layers",
+    "empty_groups",
+    "shared_text_styles",
+    "shared_color_styles"
+  ];
+
+  // Basic normalization
+  const s = sketch_audit || {};
+  const f = figma_meta || {}; // may be empty in stub mode
+
+  // Compute deltas and a simple score (lower deltas => higher score)
+  let totalPenalty = 0;
+  const details = {};
+  for (const k of fields) {
+    const a = numberish(s[k]);
+    const b = numberish(f[k]);
+    const hasB = Number.isFinite(b);
+    const delta = hasB ? Math.abs(a - b) : null;
+
+    details[k] = { sketch: a, figma: hasB ? b : "unknown", delta };
+
+    if (hasB) {
+      // Penalty weight: relative error capped, so one huge mismatch doesn't nuke the score
+      const denom = Math.max(1, a);
+      const rel = Math.min(1, delta / denom); // 0..1
+      totalPenalty += rel; // each field contributes up to 1
+    } else {
+      // If we don't have Figma numbers yet, don't penalize (stub mode)
+      totalPenalty += 0;
+    }
+  }
+
+  // Score: 100 - percentage of penalties across fields with F values
+  const fieldsWithF = fields.filter(k => Number.isFinite(numberish(f[k]))).length;
+  const denom = Math.max(1, fieldsWithF); // avoid divide by zero (stub mode)
+  const score = clamp(100 - (totalPenalty / denom) * 100, 0, 100);
+
+  // Build Markdown report
+  const md = renderReport({
+    file_id,
+    score,
+    details,
+    notes: notes || "",
+    figma_meta_present: fieldsWithF > 0
   });
-};
+
+  // Save REPORT.md to Blob
+  let reportUrl = null;
+  try {
+    const resp = await put(
+      `reports/${file_id}_REPORT.md`,
+      Buffer.from(md),
+      { access: "public", contentType: "text/markdown", token: process.env.BLOB_READ_WRITE_TOKEN }
+    );
+    reportUrl = resp.url;
+  } catch (e) { /* ignore write failures but still return body */ }
+
+  return res.status(200).json({
+    file_id,
+    qc_score: Math.round(score),
+    deltas: details,
+    report_url: reportUrl,
+    mode: fieldsWithF > 0 ? "metadata_parity" : "stub_no_figma_meta"
+  });
+}
+
+function numberish(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+
+function renderReport({ file_id, score, details, notes, figma_meta_present }) {
+  const lines = [];
+  lines.push(`# Sketch → Figma QC Report`);
+  lines.push(`File: \`${file_id}\``);
+  lines.push(`Date: ${new Date().toISOString()}`);
+  lines.push(``);
+  lines.push(`**QC Parity Score:** ${Math.round(score)} / 100`);
+  lines.push(``);
+  lines.push(`## What was checked`);
+  lines.push(`- Pages`);
+  lines.push(`- Symbols`);
+  lines.push(`- Text layers`);
+  lines.push(`- Hidden layers`);
+  lines.push(`- Empty groups`);
+  lines.push(`- Shared text styles`);
+  lines.push(`- Shared color styles`);
+  lines.push(``);
+  if (!figma_meta_present) {
+    lines.push(`> **Note:** Figma metadata not supplied; this report compares Sketch counts only and does not penalize missing Figma numbers. Add \`figma_meta\` later for true parity scoring.`);
+    lines.push(``);
+  }
+  lines.push(`## Deltas`);
+  lines.push(`| Metric | Sketch | Figma | Δ |`);
+  lines.push(`|---|---:|---:|---:|`);
+  for (const [k, v] of Object.entries(details)) {
+    lines.push(`| ${label(k)} | ${v.sketch} | ${v.figma} | ${v.delta ?? "—"} |`);
+  }
+  if (notes) {
+    lines.push(``);
+    lines.push(`## Notes`);
+    lines.push(notes);
+  }
+  lines.push(``);
+  lines.push(`---`);
+  lines.push(`_Generated by Cross-Platform Design Migration Agent (QC stub)._`);
+  return lines.join("\n");
+}
+
+function label(k) {
+  return ({
+    pages: "Pages",
+    symbols: "Symbols",
+    text_layers: "Text layers",
+    hidden_layers: "Hidden layers",
+    empty_groups: "Empty groups",
+    shared_text_styles: "Shared text styles",
+    shared_color_styles: "Shared color styles"
+  }[k] || k);
+}
