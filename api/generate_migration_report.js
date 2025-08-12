@@ -1,175 +1,74 @@
 // api/generate_migration_report.js
-import { put } from "@vercel/blob";
+import { put } from '@vercel/blob';
 
-export const config = { api: { bodyParser: { sizeLimit: "4mb" } } };
-
-/**
- * Expects POST JSON:
- * {
- *   "project": "Sample Project",
- *   "batch_id": "batch_001",
- *   "figma_links": [
- *     {
- *       "source_file": "path/file1.sketch",
- *       "figma_url": "https://figma.com/file/xxxxx",
- *       "status": "OK",
- *       "avg_parity": 97,
- *       "frames_total": 12,
- *       "frames_passed": 12
- *     }
- *   ]
- * }
- *
- * Returns:
- * {
- *   "report_md": "...markdown text...",
- *   "index_csv": "CSV,text,...",
- *   "mappings_json": {...},
- *   "locations": {
- *     "report_url": "https://.../exports/<project>/report/REPORT.md",
- *     "index_url": "https://.../exports/<project>/figma_links/INDEX.csv",
- *     "mappings_url": "https://.../exports/<project>/mappings/mappings.json"
- *   }
- * }
- */
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
-
-  const { project, batch_id, figma_links } = req.body || {};
-  if (!project || !batch_id || !Array.isArray(figma_links) || figma_links.length === 0) {
-    return res.status(400).json({
-      error: "project (string), batch_id (string), and figma_links (array) are required"
-    });
-  }
-
-  const nowIso = new Date().toISOString();
-  const projSlug = slug(project);
-  const base = `exports/${projSlug}`;
-
-  // 1) Build INDEX.csv (developer-handoff list)
-  const indexCsv = buildIndexCsv(figma_links);
-
-  // 2) Build mappings.json (simple summary you can extend later)
-  const mappings = {
-    project,
-    batch_id,
-    files: figma_links.map(f => ({
-      source_file: f.source_file,
-      figma_url: f.figma_url,
-      status: f.status || "Unknown",
-      avg_parity: Number.isFinite(f.avg_parity) ? f.avg_parity : null,
-      frames_total: f.frames_total ?? null,
-      frames_passed: f.frames_passed ?? null
-    })),
-    createdAt: nowIso
-  };
-
-  // 3) Build REPORT.md (client-readable)
-  const reportMd = buildReportMd({ project, batch_id, figma_links, nowIso });
-
-  // 4) Save all three to Blob (public URLs)
-  let reportUrl = null, indexUrl = null, mappingsUrl = null;
   try {
-    const r = await put(`${base}/report/REPORT.md`, Buffer.from(reportMd), {
-      access: "public",
-      contentType: "text/markdown",
-      token: process.env.BLOB_READ_WRITE_TOKEN
-    });
-    reportUrl = r.url;
-  } catch {}
-
-  try {
-    const i = await put(`${base}/figma_links/INDEX.csv`, Buffer.from(indexCsv), {
-      access: "public",
-      contentType: "text/csv",
-      token: process.env.BLOB_READ_WRITE_TOKEN
-    });
-    indexUrl = i.url;
-  } catch {}
-
-  try {
-    const m = await put(`${base}/mappings/mappings.json`, Buffer.from(JSON.stringify(mappings, null, 2)), {
-      access: "public",
-      contentType: "application/json",
-      token: process.env.BLOB_READ_WRITE_TOKEN
-    });
-    mappingsUrl = m.url;
-  } catch {}
-
-  // 5) Return inline contents + where we saved them
-  return res.status(200).json({
-    report_md: reportMd,
-    index_csv: indexCsv,
-    mappings_json: mappings,
-    locations: {
-      report_url: reportUrl,
-      index_url: indexUrl,
-      mappings_url: mappingsUrl
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed' });
     }
-  });
-}
 
-function buildIndexCsv(rows) {
-  const header = [
-    "source_file",
-    "figma_url",
-    "status",
-    "avg_parity",
-    "frames_total",
-    "frames_passed"
-  ];
-  const lines = [header.join(",")];
-  for (const r of rows) {
-    lines.push([
-      csv(r.source_file),
-      csv(r.figma_url),
-      csv(r.status || "Unknown"),
-      numberish(r.avg_parity),
-      numberish(r.frames_total),
-      numberish(r.frames_passed)
-    ].join(","));
-  }
-  return lines.join("\n");
-}
+    const { project, batch_id, figma_links = [] } = req.body || {};
+    if (!project || !batch_id || !Array.isArray(figma_links)) {
+      return res.status(400).json({ error: 'project, batch_id, and figma_links are required' });
+    }
 
-function buildReportMd({ project, batch_id, figma_links, nowIso }) {
-  const filesProcessed = figma_links.length;
-  const avgParity = average(
-    figma_links.map(f => Number.isFinite(f.avg_parity) ? f.avg_parity : null)
-  );
+    // 1) Build contents we want to save
+    const reportMd = [
+      '# Sketch → Figma Migration Report',
+      `**Project:** ${project}`,
+      `**Batch:** ${batch_id}`,
+      `**Run Date:** ${new Date().toISOString().slice(0,10)}`,
+      '',
+      '## Files',
+      ...figma_links.map((f, i) =>
+        `- ${i + 1}. ${f.source_file} → ${f.figma_url} — ${f.status} — ${f.avg_parity}% (${f.frames_passed}/${f.frames_total})`
+      )
+    ].join('\n');
 
-  const lines = [];
-  lines.push(`# Sketch → Figma Migration Report`);
-  lines.push(`Project: **${project}**`);
-  lines.push(`Batch: \`${batch_id}\``);
-  lines.push(`Run Date: ${nowIso}`);
-  lines.push("");
-  lines.push(`## Executive Summary`);
-  lines.push(`- Files processed: **${filesProcessed}**`);
-  if (avgParity != null) lines.push(`- Average visual parity: **${avgParity.toFixed(1)}%**`);
-  lines.push("");
-  lines.push(`## Files & Links`);
-  lines.push(`| # | Source Sketch | Figma URL | Frames | Avg Parity | Status |`);
-  lines.push(`| - | ------------- | --------- | -----: | ----------:| ------ |`);
-  figma_links.forEach((f, i) => {
-    lines.push(
-      `| ${i + 1} | ${safe(f.source_file)} | ${safe(f.figma_url) || "—"} | ` +
-      `${numOrDash(f.frames_total)} | ${numOrDash(f.avg_parity, "%")} | ${safe(f.status || "Unknown")} |`
+    const indexCsvHeader = 'source_file,figma_url,file_status,avg_parity,frames_total,frames_passed,timestamp';
+    const indexCsvRows = figma_links.map(f =>
+      [
+        f.source_file,
+        f.figma_url,
+        f.status,
+        f.avg_parity,
+        f.frames_total,
+        f.frames_passed,
+        new Date().toISOString()
+      ].join(',')
     );
-  });
-  lines.push("");
-  lines.push(`---`);
-  lines.push(`_Generated by your Migration Agent._`);
-  return lines.join("\n");
-}
+    const indexCsv = [indexCsvHeader, ...indexCsvRows].join('\n');
 
-function slug(s){ return String(s).toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/(^-|-$)/g,""); }
-function safe(s){ return s ? String(s) : ""; }
-function numberish(v){ const n = Number(v); return Number.isFinite(n) ? n : ""; }
-function numOrDash(v, suffix=""){ return Number.isFinite(Number(v)) ? `${Number(v)}${suffix}` : "—"; }
-function csv(v){
-  if (v == null) return "";
-  const s = String(v);
-  if (/[,"\n]/.test(s)) return `"${s.replace(/"/g,'""')}"`;
-  return s;
+    const mappingsJson = { note: 'example mappings file; fill with real component/style mappings as needed' };
+
+    // 2) Paths in the Blob store
+    const base = `exports/${project}`;
+    const reportPath   = `${base}/report/REPORT.md`;
+    const indexCsvPath = `${base}/figma_links/INDEX.csv`;
+    const mappingsPath = `${base}/mappings/mappings.json`;
+
+    const token = process.env.BLOB_READ_WRITE_TOKEN;
+
+    // 3) Save to Vercel Blob (public so you can click links)
+    await put(indexCsvPath, indexCsv, { access: 'public', token });
+    await put(reportPath, reportMd,   { access: 'public', token });
+    await put(mappingsPath, JSON.stringify(mappingsJson, null, 2), { access: 'public', token });
+
+    // 4) Return both contents (for your GPT) and the locations
+    return res.status(200).json({
+      report_md: reportMd,
+      index_csv: indexCsv,
+      mappings_json: mappingsJson,
+      locations: {
+        report:          `/${reportPath}`,
+        figma_links_index:`/${indexCsvPath}`,
+        mappings:        `/${mappingsPath}`,
+        qc:              `/${base}/qc/`,
+        cleaned_sketch:  `/${base}/cleaned_sketch/`
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to generate report', details: String(err) });
+  }
 }
